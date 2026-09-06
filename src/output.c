@@ -386,6 +386,22 @@ handle_output_request_state(struct wl_listener *listener, void *data)
 			if (wlr_output_test_state(output->wlr_output, &output->pending)) {
 				wlr_log(WLR_INFO, "re-enabling output %s for backend mode request",
 					output->wlr_output->name);
+				/*
+				 * Staging enabled=true in output->pending is not enough:
+				 * output_is_usable() (checked by handle_output_frame()
+				 * before it ever calls lab_wlr_scene_output_commit())
+				 * reads the LIVE wlr_output->enabled field, which only
+				 * changes once this pending state is actually committed.
+				 * Scheduling a frame here without committing first left
+				 * the connector staged-but-never-enabled -- the frame
+				 * callback saw enabled=false and bailed before painting
+				 * anything. Commit directly instead.
+				 */
+				if (!wlr_output_commit_state(output->wlr_output, &output->pending)) {
+					wlr_log(WLR_ERROR, "failed to commit re-enable for output %s",
+						output->wlr_output->name);
+				}
+				return;
 			} else {
 				/*
 				 * Neither worked. Drop BOTH bits rather than staging
