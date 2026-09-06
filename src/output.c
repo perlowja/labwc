@@ -360,6 +360,44 @@ handle_output_request_state(struct wl_listener *listener, void *data)
 				event->state->custom_mode.refresh);
 			break;
 		}
+
+		/*
+		 * A DP/HDMI replug reaches us as a MODE-only request while the
+		 * output is still disabled from the unplug. Staging a mode on a
+		 * disabled output makes wlroots reject the ENTIRE atomic state in
+		 * output_basic_test() ("Tried to set mode on a disabled output"),
+		 * so the output is never re-enabled and the screen stays black
+		 * until the compositor is restarted. Measured on CIX Sky1 with
+		 * both a 1-output (O6N) and a 4-output (MS-R1) topology, so this
+		 * is not specific to a multi-head layout.
+		 *
+		 * Enabling is a FALLBACK, not the default: if the mode-only state
+		 * already tests clean we change nothing. That keeps
+		 * wlr-output-power-management working -- a blanked screen is also
+		 * a disabled output, and unconditionally enabling here would turn
+		 * the display back on every time the backend reported a mode.
+		 * output->power_off records that distinction explicitly rather
+		 * than guessing from wlr_output->enabled, which is identical in
+		 * both cases.
+		 */
+		if (!output->power_off && !output->wlr_output->enabled
+				&& !wlr_output_test_state(output->wlr_output, &output->pending)) {
+			wlr_output_state_set_enabled(&output->pending, true);
+			if (wlr_output_test_state(output->wlr_output, &output->pending)) {
+				wlr_log(WLR_INFO, "re-enabling output %s for backend mode request",
+					output->wlr_output->name);
+			} else {
+				/*
+				 * Neither worked. Drop BOTH bits rather than staging
+				 * enabled=false: leaving the mode staged alongside a
+				 * disabled output rebuilds the very combination that
+				 * output_basic_test() rejects, which would poison the
+				 * next commit for an unrelated reason.
+				 */
+				output->pending.committed &=
+					~(WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE);
+			}
+		}
 		wlr_output_schedule_frame(output->wlr_output);
 		return;
 	}
@@ -534,7 +572,35 @@ configure_new_output(struct output *output)
 	 * Commit the output this way instead, HDR needs a buffer, and
 	 * this commit must be called after the output is added to the
 	 * layout above.
+	 *
+	 * lab_wlr_scene_output_commit() short-circuits via
+	 * wlr_scene_output_needs_frame() at the top of
+	 * src/common/scene-helpers.c. On a fresh or freshly-recreated
+	 * wlr_scene_output -- which is exactly what add_output_to_layout()
+	 * just built for us, and exactly what we get after a DP/HDMI
+	 * replug that the drm backend surfaced as
+	 * wlroots/backend/drm/backend.c:139 (Received hotplug event) ->
+	 * drm.c:1861 (DP-3 connected) -> handle_new_output() --
+	 * wlr_output->needs_frame is false, scene_output->pending_commit_damage
+	 * is empty, gamma_lut_changed is false, and none of the magnification
+	 * or singularity-blur conditions are true either. The helper returns
+	 * true without ever calling wlr_output_commit_state(), so the atomic
+	 * commit that would bind a CRTC to the connector never reaches the
+	 * kernel, and /sys/class/drm/card*-DP-N/{enabled,dpms} stay
+	 * "disabled"/"Off" forever. Measured on CIX Sky1 (kernel
+	 * 7.2.3-sky1-ncz, dptx driver trilin-dptx-cix) -- the unplug path
+	 * destroys the wlr_output rather than just disabling it, so by the
+	 * time the replug arrives this branch is the one that has to succeed.
+	 *
+	 * wlr_output_schedule_frame() sets wlr_output->needs_frame = true.
+	 * That is one of the three OR-ed conditions inside
+	 * wlr_scene_output_needs_frame() (wlroots 0.20 types/scene/wlr_scene.c),
+	 * so the short-circuit no longer fires and the commit runs to
+	 * completion. The idle-source wlr_output_schedule_frame() registers
+	 * becomes a no-op once our commit sets frame_pending = true in
+	 * output_apply_commit(), so it does not cause a double-commit.
 	 */
+	wlr_output_schedule_frame(wlr_output);
 	lab_wlr_scene_output_commit(output->scene_output, &output->pending);
 
 	/*
@@ -1264,6 +1330,7 @@ handle_output_power_manager_set_mode(struct wl_listener *listener, void *data)
 		if (!event->output->enabled) {
 			return;
 		}
+		output->power_off = true;
 		wlr_output_state_set_enabled(&output->pending, false);
 		output_state_commit(output);
 		break;
@@ -1271,6 +1338,7 @@ handle_output_power_manager_set_mode(struct wl_listener *listener, void *data)
 		if (event->output->enabled) {
 			return;
 		}
+		output->power_off = false;
 		wlr_output_state_set_enabled(&output->pending, true);
 		output_state_commit(output);
 		/*
