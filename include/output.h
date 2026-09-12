@@ -28,6 +28,21 @@ struct output {
 	struct wl_listener request_state;
 
 	/*
+	 * Bounded retry for the initial mode test in configure_new_output().
+	 * Hypothesis (not yet hardware-confirmed, see PR notes): on some
+	 * DP/HDMI transmitters the backend's "connected" event can arrive
+	 * slightly before the connector's mode list / link training has
+	 * fully settled, so the very first output_test_auto() attempt right
+	 * after a hotplug can fail even though the display comes up fine
+	 * moments later. enable_retry_timer re-attempts the mode test a few
+	 * times instead of leaving the output permanently disabled until
+	 * something else (e.g. a manual `wlr-randr --on`) re-applies state
+	 * by hand.
+	 */
+	struct wl_event_source *enable_retry_timer;
+	int enable_retry_count;
+
+	/*
 	 * Unique power-of-two ID used in bitsets such as view->outputs.
 	 * (This assumes there are never more than 64 outputs connected
 	 * at once; wlr_scene_output has a similar limitation.)

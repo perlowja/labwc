@@ -276,6 +276,18 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 {
 	struct output *output = wl_container_of(listener, output, destroy);
 	struct seat *seat = &server.seat;
+
+	/*
+	 * If a mode-test retry (see handle_output_enable_retry()) is still
+	 * pending, cancel it -- the output can be destroyed again (a second,
+	 * real unplug) before a queued retry fires, and the timer holds a
+	 * pointer to this struct output, which is about to be freed.
+	 */
+	if (output->enable_retry_timer) {
+		wl_event_source_remove(output->enable_retry_timer);
+		output->enable_retry_timer = NULL;
+	}
+
 	regions_evacuate_output(output);
 	regions_destroy(seat, &output->regions);
 	if (seat->overlay.active.output == output) {
@@ -499,21 +511,19 @@ output_test_auto(struct wlr_output *wlr_output, struct wlr_output_state *state,
 	return wlr_output_test_state(wlr_output, state);
 }
 
+/*
+ * Bound on how long we keep retrying a failed initial mode test after a
+ * hotplug. OUTPUT_ENABLE_RETRY_MAX attempts spaced
+ * OUTPUT_ENABLE_RETRY_DELAY_MS apart gives a real DP/HDMI link roughly two
+ * seconds to settle before we give up and leave the output disabled.
+ */
+#define OUTPUT_ENABLE_RETRY_MAX 8
+#define OUTPUT_ENABLE_RETRY_DELAY_MS 250
+
 static void
-configure_new_output(struct output *output)
+finish_output_configuration(struct output *output)
 {
 	struct wlr_output *wlr_output = output->wlr_output;
-
-	wlr_log(WLR_DEBUG, "enable output %s", wlr_output->name);
-	wlr_output_state_set_enabled(&output->pending, true);
-
-	if (!output_test_auto(wlr_output, &output->pending,
-			/* is_client_request */ false)) {
-		wlr_log(WLR_INFO, "mode test failed for output %s",
-			wlr_output->name);
-		wlr_output_state_set_enabled(&output->pending, false);
-		return;
-	}
 
 	if (rc.adaptive_sync == LAB_ADAPTIVE_SYNC_ENABLED) {
 		output_enable_adaptive_sync(output, true);
@@ -570,6 +580,82 @@ configure_new_output(struct output *output)
 	 */
 	wlr_output_effective_resolution(wlr_output,
 		&output->usable_area.width, &output->usable_area.height);
+}
+
+static int
+handle_output_enable_retry(void *data)
+{
+	struct output *output = data;
+	struct wlr_output *wlr_output = output->wlr_output;
+
+	wlr_output_state_set_enabled(&output->pending, true);
+	if (!output_test_auto(wlr_output, &output->pending,
+			/* is_client_request */ false)) {
+		wlr_output_state_set_enabled(&output->pending, false);
+		output->enable_retry_count++;
+		if (output->enable_retry_count >= OUTPUT_ENABLE_RETRY_MAX) {
+			wlr_log(WLR_ERROR,
+				"mode test still failing for output %s after %d "
+				"retries, giving up",
+				wlr_output->name, output->enable_retry_count);
+			return 0;
+		}
+		wlr_log(WLR_INFO,
+			"mode test still failing for output %s, retrying (%d/%d)",
+			wlr_output->name, output->enable_retry_count,
+			OUTPUT_ENABLE_RETRY_MAX);
+		wl_event_source_timer_update(output->enable_retry_timer,
+			OUTPUT_ENABLE_RETRY_DELAY_MS);
+		return 0;
+	}
+
+	wlr_log(WLR_INFO,
+		"output %s passed mode test after %d retr%s, enabling",
+		wlr_output->name, output->enable_retry_count,
+		output->enable_retry_count == 1 ? "y" : "ies");
+	output->enable_retry_count = 0;
+	finish_output_configuration(output);
+	return 0;
+}
+
+static void
+configure_new_output(struct output *output)
+{
+	struct wlr_output *wlr_output = output->wlr_output;
+
+	wlr_log(WLR_DEBUG, "enable output %s", wlr_output->name);
+	wlr_output_state_set_enabled(&output->pending, true);
+
+	if (!output_test_auto(wlr_output, &output->pending,
+			/* is_client_request */ false)) {
+		/*
+		 * Hypothesis, not yet hardware-confirmed (see PR notes): a
+		 * hotplug "connected" event on some DP/HDMI transmitters can
+		 * arrive before the connector's mode list / link training has
+		 * fully settled, so this first test can fail even though the
+		 * display genuinely is there. Retry a bounded number of times
+		 * on a short timer rather than permanently leaving the output
+		 * disabled -- without this, the only way to recover from that
+		 * race would be a manual `wlr-randr --on` after the link
+		 * settles, which is the exact symptom this guards against.
+		 */
+		wlr_log(WLR_INFO,
+			"mode test failed for output %s, will retry for up to %dms",
+			wlr_output->name,
+			OUTPUT_ENABLE_RETRY_MAX * OUTPUT_ENABLE_RETRY_DELAY_MS);
+		wlr_output_state_set_enabled(&output->pending, false);
+		if (!output->enable_retry_timer) {
+			output->enable_retry_timer = wl_event_loop_add_timer(
+				server.wl_event_loop, handle_output_enable_retry,
+				output);
+		}
+		output->enable_retry_count = 0;
+		wl_event_source_timer_update(output->enable_retry_timer,
+			OUTPUT_ENABLE_RETRY_DELAY_MS);
+		return;
+	}
+
+	finish_output_configuration(output);
 }
 
 static uint64_t
