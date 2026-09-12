@@ -277,12 +277,7 @@ handle_output_destroy(struct wl_listener *listener, void *data)
 	struct output *output = wl_container_of(listener, output, destroy);
 	struct seat *seat = &server.seat;
 
-	/*
-	 * If a mode-test retry (see handle_output_enable_retry()) is still
-	 * pending, cancel it -- the output can be destroyed again (a second,
-	 * real unplug) before a queued retry fires, and the timer holds a
-	 * pointer to this struct output, which is about to be freed.
-	 */
+	/* A pending retry holds this output; unplugging again would UAF. */
 	if (output->enable_retry_timer) {
 		wl_event_source_remove(output->enable_retry_timer);
 		output->enable_retry_timer = NULL;
@@ -511,12 +506,7 @@ output_test_auto(struct wlr_output *wlr_output, struct wlr_output_state *state,
 	return wlr_output_test_state(wlr_output, state);
 }
 
-/*
- * Bound on how long we keep retrying a failed initial mode test after a
- * hotplug. OUTPUT_ENABLE_RETRY_MAX attempts spaced
- * OUTPUT_ENABLE_RETRY_DELAY_MS apart gives a real DP/HDMI link roughly two
- * seconds to settle before we give up and leave the output disabled.
- */
+/* ~2s total, enough for a DP/HDMI link to finish training */
 #define OUTPUT_ENABLE_RETRY_MAX 8
 #define OUTPUT_ENABLE_RETRY_DELAY_MS 250
 
@@ -545,32 +535,13 @@ finish_output_configuration(struct output *output)
 	 * this commit must be called after the output is added to the
 	 * layout above.
 	 *
-	 * lab_wlr_scene_output_commit() short-circuits via
-	 * wlr_scene_output_needs_frame() at the top of
-	 * src/common/scene-helpers.c. On a fresh or freshly-recreated
-	 * wlr_scene_output -- which is exactly what add_output_to_layout()
-	 * just built for us, and exactly what we get after a DP/HDMI
-	 * replug that the drm backend surfaced as
-	 * wlroots/backend/drm/backend.c:139 (Received hotplug event) ->
-	 * drm.c:1861 (DP-3 connected) -> handle_new_output() --
-	 * wlr_output->needs_frame is false, scene_output->pending_commit_damage
-	 * is empty, gamma_lut_changed is false, and none of the magnification
-	 * or singularity-blur conditions are true either. The helper returns
-	 * true without ever calling wlr_output_commit_state(), so the atomic
-	 * commit that would bind a CRTC to the connector never reaches the
-	 * kernel, and /sys/class/drm/card*-DP-N/{enabled,dpms} stay
-	 * "disabled"/"Off" forever. Measured on CIX Sky1 (kernel
-	 * 7.2.3-sky1-ncz, dptx driver trilin-dptx-cix) -- the unplug path
-	 * destroys the wlr_output rather than just disabling it, so by the
-	 * time the replug arrives this branch is the one that has to succeed.
-	 *
-	 * wlr_output_schedule_frame() sets wlr_output->needs_frame = true.
-	 * That is one of the three OR-ed conditions inside
-	 * wlr_scene_output_needs_frame() (wlroots 0.20 types/scene/wlr_scene.c),
-	 * so the short-circuit no longer fires and the commit runs to
-	 * completion. The idle-source wlr_output_schedule_frame() registers
-	 * becomes a no-op once our commit sets frame_pending = true in
-	 * output_apply_commit(), so it does not cause a double-commit.
+	 * A freshly-created wlr_scene_output has needs_frame false, so
+	 * lab_wlr_scene_output_commit() short-circuits on
+	 * wlr_scene_output_needs_frame() and the atomic commit that binds a
+	 * CRTC to the connector never reaches the kernel -- black screen
+	 * after a DP/HDMI replug, since the unplug destroys the wlr_output
+	 * and the replug comes back through here. Scheduling a frame sets
+	 * needs_frame so the commit actually runs.
 	 */
 	wlr_output_schedule_frame(wlr_output);
 	lab_wlr_scene_output_commit(output->scene_output, &output->pending);
@@ -629,15 +600,10 @@ configure_new_output(struct output *output)
 	if (!output_test_auto(wlr_output, &output->pending,
 			/* is_client_request */ false)) {
 		/*
-		 * Hypothesis, not yet hardware-confirmed (see PR notes): a
-		 * hotplug "connected" event on some DP/HDMI transmitters can
-		 * arrive before the connector's mode list / link training has
-		 * fully settled, so this first test can fail even though the
-		 * display genuinely is there. Retry a bounded number of times
-		 * on a short timer rather than permanently leaving the output
-		 * disabled -- without this, the only way to recover from that
-		 * race would be a manual `wlr-randr --on` after the link
-		 * settles, which is the exact symptom this guards against.
+		 * Some DP/HDMI transmitters report "connected" before the mode
+		 * list / link training settles, so this first test can fail for
+		 * a display that is really there. Without a retry the output
+		 * stays disabled until a manual `wlr-randr --on`.
 		 */
 		wlr_log(WLR_INFO,
 			"mode test failed for output %s, will retry for up to %dms",
