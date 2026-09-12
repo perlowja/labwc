@@ -28,15 +28,6 @@ struct output {
 	struct wl_listener request_state;
 
 	/*
-	 * True while this output is off because a client asked for it via
-	 * wlr-output-power-management (screen blanking), as opposed to being
-	 * disabled because the cable was pulled. handle_output_request_state()
-	 * needs to tell those apart: a replug must re-enable the output, a
-	 * blanked screen must stay blank.
-	 */
-	bool power_off;
-
-	/*
 	 * Unique power-of-two ID used in bitsets such as view->outputs.
 	 * (This assumes there are never more than 64 outputs connected
 	 * at once; wlr_scene_output has a similar limitation.)

@@ -360,60 +360,6 @@ handle_output_request_state(struct wl_listener *listener, void *data)
 				event->state->custom_mode.refresh);
 			break;
 		}
-
-		/*
-		 * A DP/HDMI replug reaches us as a MODE-only request while the
-		 * output is still disabled from the unplug. Staging a mode on a
-		 * disabled output makes wlroots reject the ENTIRE atomic state in
-		 * output_basic_test() ("Tried to set mode on a disabled output"),
-		 * so the output is never re-enabled and the screen stays black
-		 * until the compositor is restarted. Measured on CIX Sky1 with
-		 * both a 1-output (O6N) and a 4-output (MS-R1) topology, so this
-		 * is not specific to a multi-head layout.
-		 *
-		 * Enabling is a FALLBACK, not the default: if the mode-only state
-		 * already tests clean we change nothing. That keeps
-		 * wlr-output-power-management working -- a blanked screen is also
-		 * a disabled output, and unconditionally enabling here would turn
-		 * the display back on every time the backend reported a mode.
-		 * output->power_off records that distinction explicitly rather
-		 * than guessing from wlr_output->enabled, which is identical in
-		 * both cases.
-		 */
-		if (!output->power_off && !output->wlr_output->enabled
-				&& !wlr_output_test_state(output->wlr_output, &output->pending)) {
-			wlr_output_state_set_enabled(&output->pending, true);
-			if (wlr_output_test_state(output->wlr_output, &output->pending)) {
-				wlr_log(WLR_INFO, "re-enabling output %s for backend mode request",
-					output->wlr_output->name);
-				/*
-				 * Staging enabled=true in output->pending is not enough:
-				 * output_is_usable() (checked by handle_output_frame()
-				 * before it ever calls lab_wlr_scene_output_commit())
-				 * reads the LIVE wlr_output->enabled field, which only
-				 * changes once this pending state is actually committed.
-				 * Scheduling a frame here without committing first left
-				 * the connector staged-but-never-enabled -- the frame
-				 * callback saw enabled=false and bailed before painting
-				 * anything. Commit directly instead.
-				 */
-				if (!wlr_output_commit_state(output->wlr_output, &output->pending)) {
-					wlr_log(WLR_ERROR, "failed to commit re-enable for output %s",
-						output->wlr_output->name);
-				}
-				return;
-			} else {
-				/*
-				 * Neither worked. Drop BOTH bits rather than staging
-				 * enabled=false: leaving the mode staged alongside a
-				 * disabled output rebuilds the very combination that
-				 * output_basic_test() rejects, which would poison the
-				 * next commit for an unrelated reason.
-				 */
-				output->pending.committed &=
-					~(WLR_OUTPUT_STATE_ENABLED | WLR_OUTPUT_STATE_MODE);
-			}
-		}
 		wlr_output_schedule_frame(output->wlr_output);
 		return;
 	}
@@ -1346,7 +1292,6 @@ handle_output_power_manager_set_mode(struct wl_listener *listener, void *data)
 		if (!event->output->enabled) {
 			return;
 		}
-		output->power_off = true;
 		wlr_output_state_set_enabled(&output->pending, false);
 		output_state_commit(output);
 		break;
@@ -1354,7 +1299,6 @@ handle_output_power_manager_set_mode(struct wl_listener *listener, void *data)
 		if (event->output->enabled) {
 			return;
 		}
-		output->power_off = false;
 		wlr_output_state_set_enabled(&output->pending, true);
 		output_state_commit(output);
 		/*
